@@ -43,24 +43,8 @@
 // 10 MHz max SPI frequency for intialisation
 #define ICM20689_MAX_SPI_INIT_CLK_HZ 1000000
 
-static void icm20689SpiInit(const busDevice_t *bus)
-{
-    static bool hardwareInitialised = false;
-
-    if (hardwareInitialised) {
-        return;
-    }
-
-
-    spiSetDivisor(bus->busdev_u.spi.instance, spiCalculateDivider(ICM20689_MAX_SPI_CLK_HZ));
-
-    hardwareInitialised = true;
-}
-
 uint8_t icm20689SpiDetect(const busDevice_t *bus)
 {
-    icm20689SpiInit(bus);
-
     spiSetDivisor(bus->busdev_u.spi.instance, spiCalculateDivider(ICM20689_MAX_SPI_INIT_CLK_HZ));
 
     // reset the device configuration

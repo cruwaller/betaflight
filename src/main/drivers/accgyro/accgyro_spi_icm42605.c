@@ -43,11 +43,33 @@
 #include "drivers/sensor.h"
 #include "drivers/time.h"
 
+
+struct icm42605_aaf_s {
+    uint16_t    DELTSQR;
+    uint8_t     DELT;
+    uint8_t     BITSHIFT;
+};
+
+struct icm42605_aaf_s icm42605_aaf[4] = {
+    /* GYRO_HARDWARE_LPF_EXPERIMENTAL = default = 995Hz */
+    {3968, 31, 3},
+    /* GYRO_HARDWARE_LPF_AAF_319 */
+    {680, 26, 6}, // 319Hz
+    //{848, 29, 5}, // 364Hz - not good
+    /* GYRO_HARDWARE_LPF_AAF_236 */
+    {400, 20, 6},
+    /* GYRO_HARDWARE_LPF_AAF_184 */
+    {256, 16, 7},
+};
+
+
 // 24 MHz max SPI frequency
 #define ICM42605_MAX_SPI_CLK_HZ 24000000
 
 // 10 MHz max SPI frequency for intialisation
 #define ICM42605_MAX_SPI_INIT_CLK_HZ 1000000
+
+#define ICM42605_BANK_SELECT                        0x76
 
 #define ICM42605_RA_PWR_MGMT0                       0x4E
 
@@ -59,10 +81,17 @@
 #define ICM42605_RA_GYRO_CONFIG0                    0x4F
 #define ICM42605_RA_ACCEL_CONFIG0                   0x50
 
+#define ICM42605_RA_GYRO_CONFIG1                    0x51
+#define ICM42605_GYRO_FILTER_ORDER                  3 // 1..3
+
 #define ICM42605_RA_GYRO_ACCEL_CONFIG0              0x52
 
-#define ICM42605_ACCEL_UI_FILT_BW_LOW_LATENCY       (14 << 4)
+#define ICM42605_ACCEL_UI_FILT_BW_LOW_LATENCY       (14 << 4) // = Dec2 runs at max(400Hz, ODR)
 #define ICM42605_GYRO_UI_FILT_BW_LOW_LATENCY        (14 << 0)
+#define ICM42605_GYRO_UI_FILT_VALUE                 (ICM42605_ACCEL_UI_FILT_BW_LOW_LATENCY | ICM42605_GYRO_UI_FILT_BW_LOW_LATENCY)
+#define ICM42605_ACCEL_UI_FILT_BW_LOW_LATENCY_LPF   (7U << 4) // max(400Hz, ODR) / 40 = 400Hz
+#define ICM42605_GYRO_UI_FILT_BW_LOW_LATENCY_LPF    (7U << 0) // max(400Hz, ODR) / 40 = 400Hz
+#define ICM42605_GYRO_UI_FILT_VALUE_LPF             (ICM42605_ACCEL_UI_FILT_BW_LOW_LATENCY_LPF | ICM42605_GYRO_UI_FILT_BW_LOW_LATENCY_LPF)
 
 #define ICM42605_RA_GYRO_DATA_X1                    0x25
 #define ICM42605_RA_ACCEL_DATA_X1                   0x1F
@@ -90,29 +119,23 @@
 #define ICM42605_INT_TPULSE_DURATION_100            (0 << ICM42605_INT_TPULSE_DURATION_BIT)
 #define ICM42605_INT_TPULSE_DURATION_8              (1 << ICM42605_INT_TPULSE_DURATION_BIT)
 
-
 #define ICM42605_RA_INT_SOURCE0                     0x65
 #define ICM42605_UI_DRDY_INT1_EN_DISABLED           (0 << 3)
 #define ICM42605_UI_DRDY_INT1_EN_ENABLED            (1 << 3)
 
-static void icm42605SpiInit(const busDevice_t *bus)
-{
-    static bool hardwareInitialised = false;
+// BANK2 registers
+#define ICM42605_GYRO_CONFIG_STATIC2                0x0B
+#define ICM42605_GYRO_CONFIG_STATIC2_AAF_DIS        0x2
+#define ICM42605_GYRO_CONFIG_STATIC2_AAF_EN         0x0
+#define ICM42605_GYRO_CONFIG_STATIC2_NF_DIS         0x1
+#define ICM42605_GYRO_CONFIG_STATIC2_NF_EN          0x0
+#define ICM42605_GYRO_CONFIG_STATIC3                0x0C
+#define ICM42605_GYRO_CONFIG_STATIC4                0x0D
+#define ICM42605_GYRO_CONFIG_STATIC5                0x0E
 
-    if (hardwareInitialised) {
-        return;
-    }
-
-
-    spiSetDivisor(bus->busdev_u.spi.instance, spiCalculateDivider(ICM42605_MAX_SPI_CLK_HZ));
-
-    hardwareInitialised = true;
-}
 
 uint8_t icm42605SpiDetect(const busDevice_t *bus)
 {
-    icm42605SpiInit(bus);
-
     spiSetDivisor(bus->busdev_u.spi.instance, spiCalculateDivider(ICM42605_MAX_SPI_INIT_CLK_HZ));
 
     spiBusWriteRegister(bus, ICM42605_RA_PWR_MGMT0, 0x00);
@@ -163,6 +186,7 @@ bool icm42605AccRead(accDev_t *acc)
 
     return true;
 }
+
 bool icm42605SpiAccDetect(accDev_t *acc)
 {
     switch (acc->mpuDetectionResult.sensor) {
@@ -192,6 +216,8 @@ static odrEntry_t icm42605PkhzToSupportedODRMap[] = {
 
 void icm42605GyroInit(gyroDev_t *gyro)
 {
+    uint8_t const lpf_mode = gyro->hardware_lpf;
+
     mpuGyroInit(gyro);
 
     spiSetDivisor(gyro->bus.busdev_u.spi.instance, spiCalculateDivider(ICM42605_MAX_SPI_INIT_CLK_HZ));
@@ -227,10 +253,35 @@ void icm42605GyroInit(gyroDev_t *gyro)
     spiBusWriteRegister(&gyro->bus, ICM42605_RA_ACCEL_CONFIG0, (3 - INV_FSR_16G) << 5 | (outputDataRate & 0x0F));
     delay(15);
 
-    spiBusWriteRegister(&gyro->bus, ICM42605_RA_GYRO_ACCEL_CONFIG0, ICM42605_ACCEL_UI_FILT_BW_LOW_LATENCY | ICM42605_GYRO_UI_FILT_BW_LOW_LATENCY);
+    spiBusWriteRegister(&gyro->bus, ICM42605_RA_GYRO_ACCEL_CONFIG0, (lpf_mode ? ICM42605_GYRO_UI_FILT_VALUE_LPF : ICM42605_GYRO_UI_FILT_VALUE));
+#if defined(ICM42605_GYRO_FILTER_ORDER)
+#if (ICM42605_GYRO_FILTER_ORDER < 1 || 3 < ICM42605_GYRO_FILTER_ORDER)
+#error "ICM42605_GYRO_FILTER_ORDER range is 1...3"
+#endif
+    spiBusWriteRegister(&gyro->bus, ICM42605_RA_GYRO_CONFIG1, 0x12 | ((ICM42605_GYRO_FILTER_ORDER - 1) << 2));
+#endif
 
     spiBusWriteRegister(&gyro->bus, ICM42605_RA_INT_CONFIG, ICM42605_INT1_MODE_PULSED | ICM42605_INT1_DRIVE_CIRCUIT_PP | ICM42605_INT1_POLARITY_ACTIVE_HIGH);
     spiBusWriteRegister(&gyro->bus, ICM42605_RA_INT_CONFIG0, ICM42605_UI_DRDY_INT_CLEAR_ON_SBR);
+
+    if (lpf_mode && lpf_mode < 4) {
+        struct icm42605_aaf_s * aaf_cfg = &icm42605_aaf[lpf_mode-1];
+        // Switch to USR Bank 1
+        spiBusWriteRegister(&gyro->bus, ICM42605_BANK_SELECT, 1);
+
+        // Disable notch filters and enable AAF/LPF
+        spiBusWriteRegister(&gyro->bus, ICM42605_GYRO_CONFIG_STATIC2, (0xA8 | ICM42605_GYRO_CONFIG_STATIC2_AAF_EN | ICM42605_GYRO_CONFIG_STATIC2_NF_DIS));
+
+        // GYRO_CONFIG_STATIC3 (reset 0x3F = 63)
+        spiBusWriteRegister(&gyro->bus, ICM42605_GYRO_CONFIG_STATIC3, (0x80 | aaf_cfg->DELT));
+        // GYRO_CONFIG_STATIC4 (reset 0x80 = 128)
+        spiBusWriteRegister(&gyro->bus, ICM42605_GYRO_CONFIG_STATIC4, (aaf_cfg->DELTSQR & 0xFF));
+        // GYRO_CONFIG_STATIC5 (reset 0x3F = 63)
+        spiBusWriteRegister(&gyro->bus, ICM42605_GYRO_CONFIG_STATIC5, (aaf_cfg->BITSHIFT << 4) | ((aaf_cfg->DELTSQR >> 8) & 0xf));
+
+        // Switch back to USR Bank 0
+        spiBusWriteRegister(&gyro->bus, ICM42605_BANK_SELECT, 0);
+    }
 
 #ifdef USE_MPU_DATA_READY_SIGNAL
     spiBusWriteRegister(&gyro->bus, ICM42605_RA_INT_SOURCE0, ICM42605_UI_DRDY_INT1_EN_ENABLED);
@@ -242,7 +293,6 @@ void icm42605GyroInit(gyroDev_t *gyro)
 
     spiBusWriteRegister(&gyro->bus, ICM42605_RA_INT_CONFIG1, intConfig1Value);
 #endif
-    //
 
     spiSetDivisor(gyro->bus.busdev_u.spi.instance, spiCalculateDivider(ICM42605_MAX_SPI_CLK_HZ));
 }
